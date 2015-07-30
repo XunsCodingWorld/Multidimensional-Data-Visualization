@@ -1,0 +1,157 @@
+#version 420 core
+
+// phong.vsh - an implementation of the Phong Model for a vertex shader
+
+// Per-vertex attributes
+layout (location = 0) in vec3 mcPosition; // position in model coordinates
+in vec3 mcNormal; // normal vector in model coordinates
+in vec2 texCoords; // (s,t)
+
+in vec3 ka;
+in vec3 kd;
+in vec3 ks;
+in float shininess;
+in float alpha;
+
+// Output to fragment shader:
+out vec4 colorToFS;
+out vec2 texCoordsToFS; // (s,t)
+
+// =============== BEGIN: PHONG LIGHTING MODEL ==============================
+
+// Per-primitive attributes
+// 1. Light sources
+const int MAX_NUM_LIGHTS = 3;
+uniform int actualNumLights = 0;
+// Light source positions assumed to be given in eye coordinates:
+uniform vec4 ecLightPosition[MAX_NUM_LIGHTS];
+uniform vec3 lightStrength[MAX_NUM_LIGHTS]; // (r,g,b) strength
+uniform vec3 globalAmbient = vec3(0.1, 0.1, 0.1);
+// 2. Transformation
+uniform mat4 mc_ec, ec_lds;
+
+uniform int lmFlags = 2047; // all lights and lighting model pieces enabled.
+
+float compute_liHat(in int i, in vec3 Q, out vec3 liHat)
+{
+	if (ecLightPosition[i].w > 0.0)
+	{
+		vec3 li = ecLightPosition[i].xyz - Q;
+		// Compute distance between surface and light position (in case we add
+		// attenuation later)
+		float d = length(li);
+		// Normalize the vector from surface to light position
+		liHat = li/d;
+		return d; // distance from point light to point on surface
+	}
+	// directional light - no distance attenuation
+	liHat = normalize(ecLightPosition[i].xyz);
+	return 0.0;
+}
+
+void handleLight(in int i, in vec3 liHat, in float distToLight, in vec3 nHat,
+	in vec3 Q, in bool isParallel, in vec3 pDirHat,
+	inout vec3 Diffuse, inout vec3 Specular)
+{
+	// All input to this function is assumed to be in eye coordinates. The
+	// function operates completely in eye coordinates.
+
+	// 1. COMPUTE UNIT VECTOR FROM SURFACE POINT TO EYE.
+	// If this is a parallel projection, the eye is at infinity, and we use
+	// the projection direction for vHat. Otherwise the vector to the eye is
+	// E-Q=(0,0,0)-Q.
+	vec3 vHat;
+	if (isParallel)
+		vHat = pDirHat;
+	else
+		vHat = -normalize(Q);
+
+	// 2. DETERMINE IF SURFACE NORMAL VECTOR NEEDS TO BE FLIPPED.
+	vec3 use_nHat = nHat;
+	if (dot(vHat,nHat) < 0.0)
+		// we are looking at this surface from behind; flip the normal
+		use_nHat = -use_nHat;
+
+	// For diffuse term:
+	float nHatDotLiHat = dot(use_nHat, liHat);
+
+	// if translucent, light can shine through
+	if ((alpha < 1.0) && (nHatDotLiHat < 0.0))
+		nHatDotLiHat = -(1.0 - alpha)*nHatDotLiHat;
+
+	if (nHatDotLiHat > 0.0) // Light source on correct side of surface, so:
+	{
+		Diffuse  += lightStrength[i] * nHatDotLiHat;
+		vec3 riHat = 2.0*nHatDotLiHat*use_nHat - liHat;
+		float riHatDotVHat = dot(riHat,vHat);
+		if (riHatDotVHat > 0.0) // Viewer on correct side of normal vector, so:
+			Specular += lightStrength[i] * pow(riHatDotVHat, shininess);
+	}
+}
+
+vec3 phong(in vec3 ec_Q, in vec3 ec_nHat, in bool isParallel, in vec3 pDirHat)
+{
+	// "nHat" has unit length on entry, and it is given in eye coordinates.
+
+	// Declare and initialize the light intensity accumulators
+	vec3 Diffuse  = vec3 (0.0);
+	vec3 Specular = vec3 (0.0);
+	vec3 liHat;
+
+	for (int lsi=0 ; lsi<actualNumLights ; lsi++)
+	{
+		if ((lmFlags & (1 << lsi)) != 0)
+		{
+			float dist = compute_liHat(lsi, ec_Q, liHat);
+			handleLight(lsi, liHat, dist, ec_nHat, ec_Q, isParallel, pDirHat, Diffuse, Specular);
+		}
+	}
+
+	vec3 color = vec3(0.0);
+	int materialFlags = lmFlags / 256;
+	if ((materialFlags%2) != 0)
+		color += globalAmbient * ka;
+	if (((materialFlags/2)%2) != 0)
+		color += Diffuse  * kd;
+	if (((materialFlags/4) % 2) != 0)
+		color += Specular * ks;
+	return clamp( color, 0.0, 1.0 );
+}
+
+bool parallelProjection(in mat4 M, out vec3 pDir)
+{
+	// GLSL matrices are actually transposed from the way we
+	// normally think of them. Hence testing for the bottom row
+	// (i.e., row 3) starting with (0,0,0), we need to check for
+	// column 3 starting with (0,0,0):
+	if ((M[0][3] == 0.0) && (M[1][3] == 0.0) && (M[2][3] == 0.0))
+	{
+		pDir[0] = -M[2][0]/M[0][0];
+		pDir[1] = -M[2][1]/M[1][1];
+		pDir[2] = 1.0;
+		return true;
+	}
+	return false;
+}
+
+// ================= END: PHONG LIGHTING MODEL ==============================
+
+void main (void)
+{
+	vec3 pDir;
+	bool isParallel = parallelProjection(ec_lds, pDir);
+	if (isParallel)
+		pDir = normalize(pDir);
+	// convert current vertex and its associated normal to eye coordinates
+	// ("p_" prefix emphasizes it is stored in projective space)
+	vec4 p_ecPosition = mc_ec * vec4(mcPosition, 1.0);
+	mat3 normalMatrix = transpose( inverse( mat3x3(mc_ec) ) );
+	vec3 ec_nHat = normalize(normalMatrix * mcNormal);
+	// compute vertex color from Phong model
+	colorToFS = vec4(phong(p_ecPosition.xyz, ec_nHat, isParallel, pDir), alpha);
+	
+	texCoordsToFS = texCoords;
+
+	// need to compute projection coordinates for given point
+	gl_Position = ec_lds * p_ecPosition;
+}
